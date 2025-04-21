@@ -3,256 +3,180 @@ using UnityEngine.UI;
 using TMPro;
 using System;
 using System.Collections.Generic;
-using System.IO; // Required for File and Path operations
+using System.IO;
 using System.Threading.Tasks;
 using Unity.Services.Core;
 using Unity.Services.Authentication;
 using Unity.Services.CloudSave;
-using Unity.Services.CloudSave.Models; // Needed for FileItem
-#if UNITY_EDITOR // AssetDatabase is editor-only
+using Unity.Services.CloudSave.Models;
+#if UNITY_EDITOR
 using UnityEditor;
 #endif
 
-// Ensure Auth script runs first if needed, or rely on Initializer
-// [RequireComponent(typeof(UGSAuthentication))] 
 public class UGS_PlayerFiles_Image : MonoBehaviour
 {
-    [Header("Source Asset")]
-    [Tooltip("Assign the Texture2D asset from your Project folder to upload.")]
-    public Texture2D sourceImageAsset; // Assign in Inspector
+    [Header("Source Asset (for Upload)")]
+    [Tooltip("Assign the Texture2D asset from your Project folder ONLY for the initial upload.")]
+    public Texture2D sourceImageAsset; // Assign for UPLOAD
 
-    [Header("Download/Display")]
-    [Tooltip("Assign a UI RawImage component to display the downloaded image.")]
-    public RawImage displayImage; // Assign a UI RawImage component here
-    [Tooltip("Filename to use when downloading the file (within PersistentDataPath).")]
-    public string downloadFilename = "downloaded_image.png"; // Filename for saving download
+    [Header("Cloud File Management")]
+    [Tooltip("The exact filename (key) to use in Cloud Save Player Files. MUST match the intended file.")]
+    public string cloudSaveKey = "my_uploaded_image.png"; // *** SET THIS MANUALLY TO THE FILENAME YOU WANT TO MANAGE ***
+
+    [Tooltip("Relative path within Assets folder to save the downloaded file (e.g., Textures/Downloaded). MUST match original location for RawImage re-linking.")]
+    public string savePathInAssets = "Textures/Downloaded"; // *** SET YOUR DESIRED SAVE FOLDER ***
 
     [Header("UI Elements")]
     public Button uploadButton;
     public Button downloadButton;
-    public Button listFilesButton;
+    public Button listFilesButton; // Note: Will only list metadata for the specific cloudSaveKey
     public Button deleteButton;
-    public TMP_Text statusText; // Can reuse status text
-
-    private string _cloudSaveKey = null; // Will be derived from sourceImageAsset name
+    public TMP_Text statusText;
+    // Removed RawImage reference - relying on AssetDatabase refresh
 
     void Start()
     {
         if (uploadButton) uploadButton.onClick.AddListener(UploadImageFile);
-        if (downloadButton) downloadButton.onClick.AddListener(DownloadImageFile);
-        if (listFilesButton) listFilesButton.onClick.AddListener(ListPlayerFiles);
+        if (downloadButton) downloadButton.onClick.AddListener(DownloadAndSaveToAssets);
+        if (listFilesButton) listFilesButton.onClick.AddListener(ListSpecificFileMetadata); // Renamed listener
         if (deleteButton) deleteButton.onClick.AddListener(DeleteImageFile);
 
-        // Derive the key from the assigned texture name
-        if (sourceImageAsset != null)
+        // Validate essential configuration
+        if (string.IsNullOrEmpty(cloudSaveKey))
         {
-            _cloudSaveKey = sourceImageAsset.name + ".png"; // Assuming PNG, adjust if needed
-            UpdateStatus($"Ready. Will manage file '{_cloudSaveKey}' in Cloud Save Player Files.");
+            UpdateStatus("Error: 'Cloud Save Key' must be set in the Inspector.");
+            SetButtonsInteractable(false); // Disable all buttons
+        }
+        else if (sourceImageAsset == null)
+        {
+            UpdateStatus("Warning: 'Source Image Asset' not assigned. Upload will be disabled.");
+            if (uploadButton) uploadButton.interactable = false;
         }
         else
         {
-            UpdateStatus("Ready. Assign 'Source Image Asset' in Inspector to enable upload/download/delete.");
-            // Disable buttons if no source asset is assigned
-            if (uploadButton) uploadButton.interactable = false;
-            if (downloadButton) downloadButton.interactable = false;
-            if (deleteButton) deleteButton.interactable = false;
+            // Optionally derive key from source asset ONLY if key isn't manually set
+            // if (string.IsNullOrEmpty(cloudSaveKey)) {
+            //    _cloudSaveKey = Path.ChangeExtension(sourceImageAsset.name, ".png");
+            // }
+            UpdateStatus($"Ready. Managing file '{cloudSaveKey}' in Cloud Save Player Files.");
         }
-
-        if (displayImage) displayImage.texture = null; // Clear display initially
     }
 
     // --- Upload Image File ---
     public async void UploadImageFile()
     {
-        if (!EnsurePrerequisites(true)) return; // Check sign-in and source asset
+        // Check sign-in, source asset, and key
+        if (!EnsurePrerequisites(requireSourceAsset: true, requireKey: true)) return;
 
         UpdateStatus($"Reading and encoding image '{sourceImageAsset.name}'...");
         byte[] imageBytes;
         try
         {
-            // Ensure texture is readable (Requires Read/Write Enabled in import settings)
             if (!sourceImageAsset.isReadable)
             {
                 UpdateStatus($"Error: Texture '{sourceImageAsset.name}' is not readable. Enable Read/Write in Import Settings.");
-                Debug.LogError($"Texture '{sourceImageAsset.name}' is not readable.");
                 return;
             }
-            imageBytes = sourceImageAsset.EncodeToPNG(); // Or EncodeToJPG()
+            imageBytes = sourceImageAsset.EncodeToPNG(); // Encode to PNG
             if (imageBytes == null || imageBytes.Length == 0)
             {
                 UpdateStatus("Error: Failed to encode image to bytes.");
                 return;
             }
         }
-        catch (Exception e)
+        catch (Exception e) { UpdateStatus($"Error encoding image: {e.Message}"); Debug.LogError(e); return; }
+
+        UpdateStatus($"Uploading '{cloudSaveKey}' ({imageBytes.Length} bytes) to Player Files...");
+        try
         {
-            UpdateStatus($"Error encoding image: {e.Message}");
-            Debug.LogError($"Error encoding image: {e}");
+            await CloudSaveService.Instance.Files.Player.SaveAsync(cloudSaveKey, imageBytes);
+            UpdateStatus($"File '{cloudSaveKey}' uploaded successfully!");
+        }
+        catch (Exception e) { HandleException("Upload", e); }
+    }
+
+    // --- Download Image File (Saves to Assets path) ---
+    public async void DownloadAndSaveToAssets()
+    {
+        // Only need sign-in and key for download
+        if (!EnsurePrerequisites(requireSourceAsset: false, requireKey: true)) return;
+        if (string.IsNullOrEmpty(savePathInAssets))
+        {
+            UpdateStatus("Error: 'Save Path In Assets' cannot be empty.");
             return;
         }
 
-        UpdateStatus($"Uploading '{_cloudSaveKey}' ({imageBytes.Length} bytes) to Player Files...");
+        string filename = Path.GetFileName(cloudSaveKey);
+        string fullLocalDirPath = Path.Combine(Application.dataPath, savePathInAssets);
+        string fullLocalPath = Path.Combine(fullLocalDirPath, filename);
+
+        UpdateStatus($"Attempting to download '{cloudSaveKey}' to '{fullLocalPath}'...");
         try
         {
-            // Use the Files API to save the byte array
-            await CloudSaveService.Instance.Files.Player.SaveAsync(_cloudSaveKey, imageBytes);
-            UpdateStatus($"File '{_cloudSaveKey}' uploaded successfully!");
-            Debug.Log($"File '{_cloudSaveKey}' uploaded successfully!");
-        }
-        catch (CloudSaveValidationException e) { UpdateStatus($"Upload Error: {e.Message}"); Debug.LogError(e); }
-        catch (CloudSaveException e) { UpdateStatus($"Upload Error: {e.Message} (Reason: {e.Reason})"); Debug.LogError(e); }
-        catch (System.Exception e) { UpdateStatus($"Generic Upload Error: {e.Message}"); Debug.LogError(e); }
-    }
-
-    // --- Download Image File ---
-    public async void DownloadImageFile()
-    {
-        if (!EnsurePrerequisites(true)) return; // Check sign-in and source asset (to know the key)
-
-        string localDownloadPath = Path.Combine(Application.persistentDataPath, downloadFilename);
-
-        UpdateStatus($"Downloading '{_cloudSaveKey}' from Player Files to {localDownloadPath}...");
-        try
-        {
-            // Load the raw bytes from Player Files
-            byte[] fileBytes = await CloudSaveService.Instance.Files.Player.LoadBytesAsync(_cloudSaveKey);
+            byte[] fileBytes = await CloudSaveService.Instance.Files.Player.LoadBytesAsync(cloudSaveKey);
 
             if (fileBytes != null && fileBytes.Length > 0)
             {
-                UpdateStatus("Download complete. Saving file locally...");
+                UpdateStatus("Download complete. Saving file locally into Assets...");
                 try
                 {
-                    // Ensure directory exists
-                    string directoryPath = Path.GetDirectoryName(localDownloadPath);
-                    if (!string.IsNullOrEmpty(directoryPath) && !Directory.Exists(directoryPath))
+                    if (!Directory.Exists(fullLocalDirPath))
                     {
-                        Directory.CreateDirectory(directoryPath);
+                        Directory.CreateDirectory(fullLocalDirPath);
                     }
+                    File.WriteAllBytes(fullLocalPath, fileBytes);
+                    UpdateStatus($"File saved to: {fullLocalPath}. Requesting AssetDB refresh...");
+                    Debug.Log($"File saved to: {fullLocalPath}");
 
-                    // Write bytes to the local file
-                    File.WriteAllBytes(localDownloadPath, fileBytes);
-                    UpdateStatus($"File saved to: {localDownloadPath}. Loading texture...");
-                    Debug.Log($"File saved to: {localDownloadPath}");
-
-                    // --- Load into Texture for Display ---
-                    Texture2D loadedTexture = new Texture2D(2, 2); // Temp size
-                    if (loadedTexture.LoadImage(fileBytes)) // LoadImage works with PNG/JPG bytes
-                    {
-                        if (displayImage != null)
-                        {
-                            displayImage.texture = loadedTexture;
-                            displayImage.color = Color.white;
-                            UpdateStatus($"Image '{_cloudSaveKey}' downloaded and displayed.");
-                        }
-                        else
-                        {
-                            UpdateStatus($"Image '{_cloudSaveKey}' downloaded to {localDownloadPath}, but no display target assigned.");
-                        }
-
-                        // --- Refresh Asset Database (Editor Only) ---
-                        // If the download path was inside Assets/, this makes it show up
 #if UNITY_EDITOR
-                        if (localDownloadPath.StartsWith(Application.dataPath))
-                        {
-                            Debug.Log("Requesting AssetDatabase refresh...");
-                            AssetDatabase.Refresh();
-                        }
+                    AssetDatabase.Refresh(ImportAssetOptions.ForceUpdate); // Force update might help re-linking
+                    Debug.Log("AssetDatabase refresh requested.");
 #endif
-                        // --- End Refresh ---
-                    }
-                    else
-                    {
-                        UpdateStatus($"Downloaded data for '{_cloudSaveKey}', but failed to load into Texture2D.");
-                        Debug.LogError($"Texture2D.LoadImage failed for key '{_cloudSaveKey}'.");
-                    }
-                    // --- End Texture Load ---
                 }
-                catch (Exception e)
-                {
-                    UpdateStatus($"Error saving downloaded file: {e.Message}");
-                    Debug.LogError($"Error saving downloaded file: {e}");
-                }
+                catch (Exception e) { UpdateStatus($"Error saving downloaded file: {e.Message}"); Debug.LogError(e); }
             }
-            else
-            {
-                UpdateStatus($"Downloaded data for '{_cloudSaveKey}' was null or empty.");
-                Debug.LogWarning($"Downloaded data for '{_cloudSaveKey}' was null or empty.");
-            }
+            else { UpdateStatus($"Downloaded data for '{cloudSaveKey}' was null or empty."); }
         }
-        catch (CloudSaveValidationException e) { UpdateStatus($"Download Error: {e.Message}"); Debug.LogError(e); }
-        catch (CloudSaveException e)
-        {
-            if (e.Reason == CloudSaveExceptionReason.NotFound)
-            {
-                UpdateStatus($"File '{_cloudSaveKey}' not found in Player Files.");
-            }
-            else
-            {
-                UpdateStatus($"Download Error: {e.Message} (Reason: {e.Reason})");
-            }
-            Debug.LogError(e);
-        }
-        catch (System.Exception e) { UpdateStatus($"Generic Download Error: {e.Message}"); Debug.LogError(e); }
+        catch (Exception e) { HandleException("Download", e); }
     }
 
-    // --- List Player Files ---
-    public async void ListPlayerFiles()
+    // --- List Metadata for Specific File ---
+    public async void ListSpecificFileMetadata() // Renamed
     {
-        if (!EnsureSignedIn()) return;
+        // Only need sign-in and key
+        if (!EnsurePrerequisites(requireSourceAsset: false, requireKey: true)) return;
 
-        UpdateStatus("Listing files from Player Files...");
+        UpdateStatus($"Getting metadata for specific file '{cloudSaveKey}'...");
         try
         {
-            List<FileItem> fileList = await CloudSaveService.Instance.Files.Player.GetMetadataAsync();
-
-            string fileListText = $"Player Files ({fileList.Count}):\n";
-            if (fileList.Count > 0)
+            FileItem metadata = await CloudSaveService.Instance.Files.Player.GetMetadataAsync(cloudSaveKey);
+            if (metadata != null)
             {
-                foreach (var item in fileList)
-                {
-                    fileListText += $"- {item.Key} ({item.Size} bytes, Modified: {item.Modified?.ToString("yyyy-MM-dd HH:mm:ss") ?? "N/A"})\n";
-                }
+                string fileInfoText = $"Metadata for '{metadata.Key}':\n" +
+                                      $"- Size: {metadata.Size} bytes\n" +
+                                      $"- Modified: {metadata.Modified?.ToString("yyyy-MM-dd HH:mm:ss") ?? "N/A"}"; // Simplified output
+                UpdateStatus(fileInfoText);
             }
-            else
-            {
-                fileListText += "(No files found)";
-            }
-            UpdateStatus(fileListText);
-            Debug.Log(fileListText.Replace("\n", System.Environment.NewLine)); // Log with proper newlines
+            else { UpdateStatus($"Metadata retrieved for '{cloudSaveKey}', but it was null."); }
         }
-        catch (CloudSaveValidationException e) { UpdateStatus($"List Error: {e.Message}"); Debug.LogError(e); }
-        catch (CloudSaveException e) { UpdateStatus($"List Error: {e.Message} (Reason: {e.Reason})"); Debug.LogError(e); }
-        catch (System.Exception e) { UpdateStatus($"Generic List Error: {e.Message}"); Debug.LogError(e); }
+        catch (Exception e) { HandleException("List/GetMetadata", e); }
     }
 
 
     // --- Delete Image File ---
     public async void DeleteImageFile()
     {
-        if (!EnsurePrerequisites(true)) return; // Check sign-in and source asset (to know the key)
+        // Only need sign-in and key
+        if (!EnsurePrerequisites(requireSourceAsset: false, requireKey: true)) return;
 
-        UpdateStatus($"Deleting '{_cloudSaveKey}' from Player Files...");
+        UpdateStatus($"Deleting '{cloudSaveKey}' from Player Files...");
         try
         {
-            await CloudSaveService.Instance.Files.Player.DeleteAsync(_cloudSaveKey);
-            UpdateStatus($"File '{_cloudSaveKey}' deleted successfully!");
-            Debug.Log($"File '{_cloudSaveKey}' deleted successfully!");
-            if (displayImage != null) displayImage.texture = null; // Clear display
+            await CloudSaveService.Instance.Files.Player.DeleteAsync(cloudSaveKey);
+            UpdateStatus($"File '{cloudSaveKey}' delete request sent successfully!");
+            // Note: Deletion might take a moment on the backend. Listing immediately might still show it.
         }
-        catch (CloudSaveValidationException e) { UpdateStatus($"Delete Error: {e.Message}"); Debug.LogError(e); }
-        catch (CloudSaveException e)
-        {
-            if (e.Reason == CloudSaveExceptionReason.NotFound)
-            {
-                UpdateStatus($"File '{_cloudSaveKey}' not found, cannot delete.");
-            }
-            else
-            {
-                UpdateStatus($"Delete Error: {e.Message} (Reason: {e.Reason})");
-            }
-            Debug.LogError(e);
-        }
-        catch (System.Exception e) { UpdateStatus($"Generic Delete Error: {e.Message}"); Debug.LogError(e); }
+        catch (Exception e) { HandleException("Delete", e); }
     }
 
     // --- Helpers ---
@@ -270,31 +194,59 @@ public class UGS_PlayerFiles_Image : MonoBehaviour
         }
         return true;
     }
-    private bool EnsurePrerequisites(bool requireSourceAsset)
+
+    // Updated prerequisite check
+    private bool EnsurePrerequisites(bool requireSourceAsset, bool requireKey)
     {
         if (!EnsureSignedIn()) return false;
 
-        if (requireSourceAsset && sourceImageAsset == null)
+        if (requireKey && string.IsNullOrEmpty(cloudSaveKey))
         {
-            UpdateStatus("Error: 'Source Image Asset' must be assigned in the Inspector.");
+            UpdateStatus("Error: 'Cloud Save Key' must be set in the Inspector.");
             return false;
         }
-        if (requireSourceAsset && string.IsNullOrEmpty(_cloudSaveKey))
+        if (requireSourceAsset && sourceImageAsset == null)
         {
-            UpdateStatus("Error: Could not determine Cloud Save Key from Source Image Asset name.");
+            UpdateStatus("Error: 'Source Image Asset' must be assigned for this operation.");
             return false;
         }
         return true;
     }
 
+    // Centralized exception handling
+    private void HandleException(string operation, Exception e)
+    {
+        string baseMessage = $"Error during {operation}";
+        if (e is CloudSaveException csEx)
+        {
+            if (csEx.Reason == CloudSaveExceptionReason.NotFound)
+            {
+                UpdateStatus($"{baseMessage}: File '{cloudSaveKey}' not found.");
+            }
+            else
+            {
+                UpdateStatus($"{baseMessage}: {csEx.Message} (Reason: {csEx.Reason})");
+            }
+        }
+        else
+        {
+            UpdateStatus($"{baseMessage}: {e.Message}");
+        }
+        Debug.LogError($"{baseMessage}: {e}");
+    }
+
+
     private void UpdateStatus(string message)
     {
-        if (statusText != null)
-        {
-            // Append for log-like behavior
-            statusText.text += "\n" + message;
-            // Optional: Auto-scroll logic for TMP_Text if needed
-        }
-        Debug.Log($"Status Img: {message}");
+        if (statusText != null) { statusText.text = "\n" + message; }
+        Debug.Log($"Status File: {message}");
+    }
+
+    private void SetButtonsInteractable(bool isInteractable)
+    {
+        if (uploadButton) uploadButton.interactable = isInteractable;
+        if (downloadButton) downloadButton.interactable = isInteractable;
+        if (listFilesButton) listFilesButton.interactable = isInteractable;
+        if (deleteButton) deleteButton.interactable = isInteractable;
     }
 }
