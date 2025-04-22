@@ -46,7 +46,7 @@ public class UGSCloudSave_Structured : MonoBehaviour
             Id = bookId,
             Title = bookTitleInput.text,
             ISBN = bookIsbnInput.text,
-            BookAuthors = new List<string> { "Author A", "Author B" } // Example authors
+            BookAuthors = new List<string> { "Billy", "Darragh" } 
         };
 
         // Serialize to JSON
